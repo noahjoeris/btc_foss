@@ -45,7 +45,7 @@ struct Feed {
 #[derive(Clone, Debug)]
 enum Json {
     Null,
-    Bool(bool),
+    Bool(()),
     Number(f64),
     String(String),
     Array(Vec<Json>),
@@ -619,11 +619,8 @@ fn fetch_comment_events_for_range(
     }
 
     let query_text = comment_search_query_text(scope, &config.username, start_day, end_day);
-    let json = fetch_comment_search_page(token, &query_text, None)?;
-    let issue_count = json
-        .get_path(&["data", "search", "issueCount"])
-        .and_then(Json::number)
-        .unwrap_or(0.0) as i64;
+    let first_page = fetch_comment_search_page(token, &query_text, 1)?;
+    let issue_count = first_page.issue_count;
     if issue_count >= 1000 {
         if start_day >= end_day {
             return Err(format!(
@@ -645,23 +642,14 @@ fn fetch_comment_events_for_range(
     }
 
     let mut events = Vec::new();
-    collect_comment_search_page(token, config, from, &query_text, &json, &mut events)?;
-    let mut has_next = json_has_next_page(&json, &["data", "search", "pageInfo"]);
-    let mut after = json
-        .get_path(&["data", "search", "pageInfo", "endCursor"])
-        .and_then(Json::string)
-        .map(str::to_string);
+    let mut has_next = first_page.has_next;
+    collect_comment_search_page(token, config, from, &first_page.threads, &mut events)?;
+    let mut page = 2;
     while has_next {
-        let Some(cursor) = after.as_deref() else {
-            break;
-        };
-        let json = fetch_comment_search_page(token, &query_text, Some(cursor))?;
-        collect_comment_search_page(token, config, from, &query_text, &json, &mut events)?;
-        has_next = json_has_next_page(&json, &["data", "search", "pageInfo"]);
-        after = json
-            .get_path(&["data", "search", "pageInfo", "endCursor"])
-            .and_then(Json::string)
-            .map(str::to_string);
+        let search_page = fetch_comment_search_page(token, &query_text, page)?;
+        collect_comment_search_page(token, config, from, &search_page.threads, &mut events)?;
+        has_next = search_page.has_next;
+        page += 1;
     }
 
     Ok(events)
@@ -679,56 +667,24 @@ fn collect_comment_search_page(
     token: &str,
     config: &Config,
     from: &str,
-    query_text: &str,
-    json: &Json,
+    threads: &[CommentThread],
     events: &mut Vec<Event>,
 ) -> Result<()> {
-    for thread in json
-        .get_path(&["data", "search", "nodes"])
-        .and_then(Json::array)
-        .unwrap_or(&[])
-    {
-        let repo = thread
-            .get_path(&["repository", "nameWithOwner"])
-            .and_then(Json::string)
-            .unwrap_or("");
-        if !repo_allowed(config, repo) {
+    for thread in threads {
+        if !repo_allowed(config, &thread.repo) {
             continue;
         }
-        let number = thread.get("number").and_then(Json::number).unwrap_or(0.0) as i64;
-        if number <= 0 {
-            continue;
-        }
-        let thread_title = thread
-            .get("title")
-            .and_then(Json::string)
-            .unwrap_or("")
-            .to_string();
-        let thread_url = thread
-            .get("url")
-            .and_then(Json::string)
-            .unwrap_or("")
-            .to_string();
         events.extend(fetch_thread_comment_events(
             token,
             config,
             ThreadContext {
-                repo,
-                number,
-                title: &thread_title,
-                url: &thread_url,
+                repo: &thread.repo,
+                number: thread.number,
+                title: &thread.title,
+                url: &thread.url,
             },
             from,
         )?);
-    }
-    let issue_count = json
-        .get_path(&["data", "search", "issueCount"])
-        .and_then(Json::number)
-        .unwrap_or(0.0) as i64;
-    if issue_count >= 1000 {
-        return Err(format!(
-            "comment search for `{query_text}` reached GitHub search cap unexpectedly"
-        ));
     }
     Ok(())
 }
@@ -746,58 +702,80 @@ fn comment_search_scopes(config: &Config) -> BTreeSet<String> {
     scopes
 }
 
-fn fetch_comment_search_page(token: &str, query_text: &str, after: Option<&str>) -> Result<Json> {
-    let query = r#"
-query($query:String!, $after:String) {
-  search(query:$query, type:ISSUE, first:100, after:$after) {
-    issueCount
-    pageInfo { hasNextPage endCursor }
-    nodes {
-      ... on Issue {
-        id number title url
-        repository { nameWithOwner }
-      }
-      ... on PullRequest {
-        id number title url
-        repository { nameWithOwner }
-      }
-    }
-  }
+#[derive(Debug)]
+struct CommentSearchPage {
+    issue_count: i64,
+    threads: Vec<CommentThread>,
+    has_next: bool,
 }
-"#;
-    let after = after
-        .map(|cursor| format!(r#""{}""#, json_escape(cursor)))
-        .unwrap_or_else(|| "null".into());
-    let body = format!(
-        r#"{{"query":"{}","variables":{{"query":"{}","after":{}}}}}"#,
-        json_escape(query),
-        json_escape(query_text),
-        after
+
+#[derive(Debug)]
+struct CommentThread {
+    repo: String,
+    number: i64,
+    title: String,
+    url: String,
+}
+
+fn fetch_comment_search_page(
+    token: &str,
+    query_text: &str,
+    page: i64,
+) -> Result<CommentSearchPage> {
+    let url = format!(
+        "https://api.github.com/search/issues?q={}&per_page=100&page={page}",
+        url_encode(query_text)
     );
-    let output = Command::new("curl")
-        .args([
-            "-sS",
-            "-X",
-            "POST",
-            "-H",
-            &format!("Authorization: bearer {token}"),
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body,
-            "https://api.github.com/graphql",
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("curl failed with status {}", output.status));
+    let json = curl_json(token, "GET", &url, None)?;
+    if json.get("items").and_then(Json::array).is_some() {
+        return parse_comment_search_page(&json, page);
     }
-    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    let json = parse_json(&text)?;
-    if json.get_path(&["errors"]).is_some() {
-        return Err(format!("GitHub comment search returned errors: {text}"));
+    let json = curl_public_json("GET", &url, None)?;
+    parse_comment_search_page(&json, page)
+}
+
+fn parse_comment_search_page(json: &Json, page: i64) -> Result<CommentSearchPage> {
+    let issue_count = json
+        .get("total_count")
+        .and_then(Json::number)
+        .unwrap_or(0.0) as i64;
+    let mut threads = Vec::new();
+    for item in json.get("items").and_then(Json::array).unwrap_or(&[]) {
+        let repo = item
+            .get("repository_url")
+            .and_then(Json::string)
+            .and_then(repo_from_api_url)
+            .unwrap_or("")
+            .to_string();
+        let number = item.get("number").and_then(Json::number).unwrap_or(0.0) as i64;
+        let title = item
+            .get("title")
+            .and_then(Json::string)
+            .unwrap_or("")
+            .to_string();
+        let url = item
+            .get("html_url")
+            .and_then(Json::string)
+            .unwrap_or("")
+            .to_string();
+        if !repo.is_empty() && number > 0 && !title.is_empty() && !url.is_empty() {
+            threads.push(CommentThread {
+                repo,
+                number,
+                title,
+                url,
+            });
+        }
     }
-    Ok(json)
+    Ok(CommentSearchPage {
+        issue_count,
+        threads,
+        has_next: page * 100 < issue_count && page < 10,
+    })
+}
+
+fn repo_from_api_url(url: &str) -> Option<&str> {
+    url.strip_prefix("https://api.github.com/repos/")
 }
 
 struct ThreadContext<'a> {
@@ -882,13 +860,6 @@ fn json_id_string(value: Option<&Json>) -> String {
         Some(Json::Number(value)) => format!("{value:.0}"),
         _ => String::new(),
     }
-}
-
-fn json_has_next_page(json: &Json, page_info_path: &[&str]) -> bool {
-    json.get_path(page_info_path)
-        .and_then(|page_info| page_info.get("hasNextPage"))
-        .and_then(Json::bool)
-        .unwrap_or(false)
 }
 
 fn repo_matches_keywords(repo: Option<&Json>, keywords: &[String]) -> bool {
@@ -1717,8 +1688,8 @@ impl Parser {
         self.ws();
         match self.peek() {
             Some('n') => self.literal("null", Json::Null),
-            Some('t') => self.literal("true", Json::Bool(true)),
-            Some('f') => self.literal("false", Json::Bool(false)),
+            Some('t') => self.literal("true", Json::Bool(())),
+            Some('f') => self.literal("false", Json::Bool(())),
             Some('"') => self.string().map(Json::String),
             Some('[') => self.array(),
             Some('{') => self.object(),
@@ -1886,13 +1857,6 @@ impl Json {
             _ => None,
         }
     }
-
-    fn bool(&self) -> Option<bool> {
-        match self {
-            Json::Bool(value) => Some(*value),
-            _ => None,
-        }
-    }
 }
 
 fn write_parented(path: &Path, body: &str) -> Result<()> {
@@ -1961,6 +1925,18 @@ fn unescape_json_string(s: &str) -> String {
     s.replace("\\\"", "\"")
         .replace("\\n", "\n")
         .replace("\\\\", "\\")
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            write!(out, "%{byte:02X}").unwrap();
+        }
+    }
+    out
 }
 
 fn html(s: &str) -> String {
