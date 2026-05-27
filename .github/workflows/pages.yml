@@ -12,7 +12,7 @@ on:
         default: "false"
   schedule:
     - cron: "21 4 * * *"
-    - cron: "43 5 1 * *"
+    - cron: "43 5 * * 1"
 
 permissions:
   contents: read
@@ -63,7 +63,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.BTC_CONTRIBS_TOKEN || github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          BTC_CONTRIBS_FULL: ${{ github.event.schedule == '43 5 1 * *' || inputs.full == 'true' }}
+          BTC_CONTRIBS_FULL: ${{ github.event.schedule == '43 5 * * 1' || inputs.full == 'true' }}
         run: |
           mkdir -p .cache public
           FULL_ARG=""
