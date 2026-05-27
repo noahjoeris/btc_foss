@@ -177,13 +177,6 @@ fn write_local_preview_files(out: &Path, config: &Config, feed: &Feed, html: &st
         fs::write(base_dir.join("feed.json"), feed.to_json()).map_err(|e| e.to_string())?;
     }
 
-    let static_dir = out.join("static");
-    fs::create_dir_all(&static_dir).map_err(|e| e.to_string())?;
-    fs::write(
-        static_dir.join("style.css"),
-        "@import url(\"https://trevs.site/static/style.css\");\n",
-    )
-    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -212,7 +205,7 @@ impl Config {
         let mut cfg = Config {
             title: "Bitcoin FOSS Contributions".into(),
             base_path: "/btc_foss/".into(),
-            site_root: "https://trevs.site".into(),
+            site_root: "https://noahjoeris.github.io".into(),
             bootstrap_months: 5,
             ..Config::default()
         };
@@ -914,10 +907,16 @@ fn render_html(config: &Config, feed: &Feed) -> String {
     .unwrap();
     writeln!(
         out,
-        "<link rel=\"shortcut icon\" type=\"image/png\" href=\"/favicon.png\">"
+        "<link rel=\"icon\" type=\"image/svg+xml\" href=\"https://upload.wikimedia.org/wikipedia/commons/4/46/Bitcoin.svg\">"
     )
     .unwrap();
-    writeln!(out, "<link rel=\"stylesheet\" href=\"/static/style.css\">").unwrap();
+    writeln!(
+        out,
+        "<link rel=\"canonical\" href=\"{}{}\">",
+        html_attr(config.site_root.trim_end_matches('/')),
+        html_attr(&config.base_path)
+    )
+    .unwrap();
     writeln!(
         out,
         "<link rel=\"stylesheet\" href=\"{}theme-bitcoin.css\">",
@@ -931,7 +930,14 @@ fn render_html(config: &Config, feed: &Feed) -> String {
     )
     .unwrap();
     writeln!(out, "<title>{}</title></head><body>", html(&config.title)).unwrap();
-    writeln!(out, "<header><div class=\"markdown-heading\"><h1 class=\"heading-element\">trev's website</h1></div><p><a href=\"/index.html\">Home</a><a href=\"/posts/index.html\">Posts</a><a href=\"/about/index.html\">About</a></p></header>").unwrap();
+    writeln!(
+        out,
+        "<header><div class=\"markdown-heading\"><h1 class=\"heading-element\">{}</h1></div><p><a href=\"https://github.com/{}\">GitHub</a><a href=\"{}feed.json\">Feed JSON</a></p></header>",
+        html(&config.username),
+        html_attr(&config.username),
+        html_attr(&config.base_path)
+    )
+    .unwrap();
     writeln!(out, "<main class=\"btc-page\">").unwrap();
     writeln!(
         out,
@@ -1009,7 +1015,14 @@ fn render_html(config: &Config, feed: &Feed) -> String {
         }
         writeln!(out, "</ul></div></details>").unwrap();
     }
-    writeln!(out, "</div></main><footer><p>Trevor Arjeski - <a href=\"https://github.com/trevarj\">git</a> <a href=\"/rss.xml\">rss</a></p></footer>").unwrap();
+    writeln!(
+        out,
+        "</div></main><footer><p><a href=\"https://github.com/{0}\">{1}</a> - <a href=\"{2}feed.json\">feed.json</a></p></footer>",
+        html_attr(&config.username),
+        html(&config.username),
+        html_attr(&config.base_path)
+    )
+    .unwrap();
     writeln!(
         out,
         "<script defer src=\"{}btc_foss.js\"></script>",
@@ -1212,7 +1225,73 @@ html[data-theme="bitcoin"]::backdrop {
 }
 
 fn render_css() -> &'static str {
-    r#".btc-page { padding-top: var(--space-lg); }
+    r#":root {
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --standard-border-radius: 0.375rem;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg-deep); color: var(--text); }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 20% 0%, var(--body-ambient-top), transparent 28rem),
+    radial-gradient(circle at 80% 100%, var(--body-ambient-bottom), transparent 28rem),
+    linear-gradient(180deg, var(--body-bg-start), var(--body-bg-mid) 45%, var(--body-bg-end));
+  font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+a { color: var(--accent-hover); text-decoration-color: var(--link-decoration); }
+a:hover { color: var(--accent); text-shadow: var(--link-hover-shadow); }
+header,
+main,
+footer {
+  width: min(var(--measure), calc(100% - (2 * var(--page-gutter))));
+  margin-inline: auto;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-md);
+  align-items: end;
+  padding: var(--space-lg) 0 var(--space-sm);
+  border-bottom: 1px solid var(--header-divider-soft);
+}
+header h1 {
+  margin: 0;
+  color: var(--heading-color);
+  font-size: clamp(1rem, 2vw, 1.25rem);
+}
+header p,
+footer p { margin: 0; }
+header p {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+footer {
+  padding: var(--space-lg) 0;
+  color: var(--text-light);
+  border-top: 1px solid var(--footer-divider);
+}
+select {
+  color: var(--text);
+  background: var(--select-surface);
+  border: 1px solid var(--select-border);
+  border-radius: var(--standard-border-radius);
+  padding: 0.35rem 0.45rem;
+}
+details {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--standard-border-radius);
+  padding: 0.45rem 0.6rem;
+  box-shadow: var(--crt-panel-shadow);
+}
+summary { cursor: pointer; }
+.btc-page { padding-top: var(--space-lg); }
 .btc-page h1 {
   display: flex;
   align-items: center;
@@ -1694,17 +1773,17 @@ mod tests {
         let reparsed = parse_json(&feed.to_json()).unwrap();
         assert_eq!(
             reparsed.get("username").and_then(Json::string),
-            Some("trevarj")
+            Some("noahjoeris")
         );
     }
 
     #[test]
     fn renders_static_page() {
         let cfg = Config {
-            username: "trevarj".into(),
+            username: "noahjoeris".into(),
             title: "Bitcoin FOSS Contributions".into(),
             base_path: "/btc_foss/".into(),
-            site_root: "https://trevs.site".into(),
+            site_root: "https://noahjoeris.github.io".into(),
             bootstrap_months: 24,
             allowlist: BTreeSet::new(),
             keywords: vec!["bitcoin".into()],

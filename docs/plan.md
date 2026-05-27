@@ -1,8 +1,9 @@
 
 # Goal
 
-Have a github pages off of my site "trevs.site/btc_foss" that is a timeline feed
-of all my contributions to Bitcoin related open source projects on Github.
+Have a GitHub Pages site at `noahjoeris.github.io/btc_foss` that publishes a
+timeline feed of my contributions to Bitcoin-related open source projects on
+GitHub.
 
 Used to audit my work and prove that I am active in the Bitcoin space.
 

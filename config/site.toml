@@ -1,7 +1,7 @@
-username = "trevarj"
+username = "noahjoeris"
 title = "Bitcoin FOSS Contributions"
 base_path = "/btc_foss/"
-site_root = "https://trevs.site"
+site_root = "https://noahjoeris.github.io"
 bootstrap_months = 24
 
 # Curated repositories are the only repositories published in the public feed.
