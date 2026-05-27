@@ -37,6 +37,18 @@
       "thread_title": "2 commits to wizardsardine/bhwi",
       "thread_url": "https://github.com/wizardsardine/bhwi/commits?author=noahjoeris&since=2026-05-14T00:00:00Z&until=2026-05-14T23:59:59Z",
       "status": ""
+    },
+    {
+      "id": "fixture-bdk-pr",
+      "event_type": "pull_request",
+      "repo": "bitcoindevkit/bdk_wallet",
+      "title": "Improve wallet signing",
+      "url": "https://github.com/bitcoindevkit/bdk_wallet/pull/490",
+      "occurred_at": "2026-05-12T08:00:00Z",
+      "thread_id": "bitcoindevkit/bdk_wallet#490",
+      "thread_title": "Improve wallet signing",
+      "thread_url": "https://github.com/bitcoindevkit/bdk_wallet/pull/490",
+      "status": "OPEN"
     }
   ]
 }

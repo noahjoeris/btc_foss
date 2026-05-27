@@ -4,7 +4,13 @@ base_path = "/btc_foss/"
 site_root = "https://noahjoeris.github.io"
 bootstrap_months = 24
 
-# Curated repositories are the only repositories published in the public feed.
+# Organization allowlists publish activity from every repo in the org.
+allowlist_orgs = [
+  "rust-bitcoin",
+  "bitcoindevkit",
+]
+
+# Curated repositories outside the allowlisted orgs are also published.
 # Discovery finds Bitcoin-related candidates from recent public activity and
 # opens/updates a GitHub issue for manual review.
 allowlist = [
@@ -14,8 +20,6 @@ allowlist = [
   "BlockstreamResearch/rust-simplicity",
   "Coldcard/firmware",
   "fanquake/core-review",
-  "rust-bitcoin/rust-bitcoin",
-  "rust-bitcoin/rust-miniscript",
   "wizardsardine/async-hwi",
   "wizardsardine/bhwi",
 ]

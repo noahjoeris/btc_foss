@@ -17,7 +17,8 @@ Configure [config/site.toml](config/site.toml):
 - `username = "noahjoeris"`
 - `site_root = "https://noahjoeris.github.io"`
 - `base_path = "/btc_foss/"`
-- `allowlist`: repos to include in the public feed
+- `allowlist_orgs`: organizations whose repositories are included in the public feed
+- `allowlist`: additional curated repositories outside those organizations
 
 In GitHub:
 
@@ -42,5 +43,6 @@ cargo fmt -- --check
 cargo test
 cargo clippy -- -D warnings
 cargo run -- validate --config config/site.toml
+cargo run -- validate-feed --feed fixtures/feed.json
 cargo run -- fixture --config config/site.toml --feed fixtures/feed.json --out public
 ```

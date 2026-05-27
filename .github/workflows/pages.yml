@@ -44,6 +44,18 @@ jobs:
           restore-keys: |
             btc-contribs-
 
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Validate config
+        run: cargo run -- validate --config config/site.toml
+
       - name: Build generator
         run: cargo build --release
 
@@ -64,6 +76,9 @@ jobs:
             --out public/feed.json \
             --candidates .cache/candidates.md \
             $FULL_ARG
+
+      - name: Validate feed
+        run: ./target/release/btc-contribs validate-feed --feed public/feed.json
 
       - name: Render site
         run: |

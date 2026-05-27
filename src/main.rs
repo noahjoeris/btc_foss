@@ -15,6 +15,7 @@ struct Config {
     base_path: String,
     site_root: String,
     bootstrap_months: i64,
+    allowlist_orgs: BTreeSet<String>,
     allowlist: BTreeSet<String>,
     keywords: Vec<String>,
     exclude: BTreeSet<String>,
@@ -44,7 +45,7 @@ struct Feed {
 #[derive(Clone, Debug)]
 enum Json {
     Null,
-    Bool(()),
+    Bool(bool),
     Number(f64),
     String(String),
     Array(Vec<Json>),
@@ -68,13 +69,14 @@ fn run() -> Result<()> {
         "collect" => collect_cmd(&rest),
         "render" => render_cmd(&rest),
         "validate" => validate_cmd(&rest),
+        "validate-feed" => validate_feed_cmd(&rest),
         "fixture" => fixture_cmd(&rest),
         _ => usage(),
     }
 }
 
 fn usage() -> Result<()> {
-    Err("usage: btc-contribs <collect|render|validate|fixture> [--config PATH] [--feed PATH] [--state PATH] [--out PATH]".into())
+    Err("usage: btc-contribs <collect|render|validate|validate-feed|fixture> [--config PATH] [--feed PATH] [--state PATH] [--out PATH]".into())
 }
 
 fn collect_cmd(args: &[String]) -> Result<()> {
@@ -161,6 +163,62 @@ fn validate_cmd(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_feed_cmd(args: &[String]) -> Result<()> {
+    let feed_path = flag(args, "--feed").unwrap_or_else(|| "public/feed.json".into());
+    let raw = fs::read_to_string(&feed_path).map_err(|e| format!("{feed_path}: {e}"))?;
+    let json = parse_json(&raw)?;
+    required_string(&json, &["generated_at"])?;
+    required_string(&json, &["username"])?;
+    let events = json
+        .get("events")
+        .and_then(Json::array)
+        .ok_or_else(|| "feed events must be an array".to_string())?;
+
+    for (index, event) in events.iter().enumerate() {
+        for key in [
+            "id",
+            "event_type",
+            "repo",
+            "title",
+            "url",
+            "occurred_at",
+            "thread_id",
+            "thread_title",
+            "thread_url",
+        ] {
+            required_string(event, &[key]).map_err(|err| format!("event {index}: {err}"))?;
+        }
+        string_field(event, &["status"]).map_err(|err| format!("event {index}: {err}"))?;
+        let event_type = event
+            .get("event_type")
+            .and_then(Json::string)
+            .unwrap_or_default();
+        if !matches!(
+            event_type,
+            "pull_request" | "issue" | "commit" | "review" | "comment"
+        ) {
+            return Err(format!(
+                "event {index}: unsupported event_type {event_type}"
+            ));
+        }
+        let url = event.get("url").and_then(Json::string).unwrap_or_default();
+        if !url.starts_with("https://github.com/") {
+            return Err(format!("event {index}: url must point to github.com"));
+        }
+        let occurred_at = event
+            .get("occurred_at")
+            .and_then(Json::string)
+            .unwrap_or_default();
+        if !is_rfc3339_utc(occurred_at) {
+            return Err(format!(
+                "event {index}: occurred_at must be RFC3339-like UTC"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn write_local_preview_files(out: &Path, config: &Config, feed: &Feed, html: &str) -> Result<()> {
     let base_dir_name = config.base_path.trim_matches('/');
     if !base_dir_name.is_empty() {
@@ -228,6 +286,9 @@ impl Config {
                     cfg.bootstrap_months = value
                         .parse()
                         .map_err(|_| "invalid bootstrap_months".to_string())?
+                }
+                "allowlist_orgs" => {
+                    cfg.allowlist_orgs = parse_toml_array(value)?.into_iter().collect()
                 }
                 "allowlist" => cfg.allowlist = parse_toml_array(value)?.into_iter().collect(),
                 "keywords" => cfg.keywords = parse_toml_array(value)?,
@@ -372,6 +433,22 @@ query($login:String!, $from:DateTime!, $to:DateTime!) {
     Ok(json)
 }
 
+fn repo_allowed(config: &Config, repo: &str) -> bool {
+    if config.exclude.contains(repo) {
+        return false;
+    }
+    config.allowlist.contains(repo) || repo_owner_allowed(config, repo)
+}
+
+fn repo_owner_allowed(config: &Config, repo: &str) -> bool {
+    repo.split_once('/').is_some_and(|(owner, _)| {
+        config
+            .allowlist_orgs
+            .iter()
+            .any(|org| org.eq_ignore_ascii_case(owner))
+    })
+}
+
 fn extract_contributions(config: &Config, graph: &Json) -> Result<(Vec<Event>, BTreeSet<String>)> {
     let coll = graph
         .get_path(&["data", "user", "contributionsCollection"])
@@ -393,12 +470,12 @@ fn extract_contributions(config: &Config, graph: &Json) -> Result<(Vec<Event>, B
             if repo.is_empty() || config.exclude.contains(repo) {
                 continue;
             }
-            if !config.allowlist.contains(repo)
+            if !repo_allowed(config, repo)
                 && repo_matches_keywords(group.get("repository"), &config.keywords)
             {
                 candidates.insert(repo.to_string());
             }
-            if !config.allowlist.contains(repo) {
+            if !repo_allowed(config, repo) {
                 continue;
             }
             for node in group
@@ -518,122 +595,352 @@ fn commit_day_url(repo: &str, username: &str, occurred_at: &str) -> String {
 
 fn fetch_comment_events(token: &str, config: &Config, from: &str) -> Result<Vec<Event>> {
     let mut events = Vec::new();
-    let since = from.get(0..10).unwrap_or(from);
+    let start_day =
+        date_days(from).ok_or_else(|| format!("invalid comment search start date: {from}"))?;
+    let end_day = date_days(&now_rfc3339()).ok_or_else(|| "invalid current date".to_string())?;
+    for scope in comment_search_scopes(config) {
+        events.extend(fetch_comment_events_for_range(
+            token, config, &scope, start_day, end_day, from,
+        )?);
+    }
+    Ok(events)
+}
+
+fn fetch_comment_events_for_range(
+    token: &str,
+    config: &Config,
+    scope: &str,
+    start_day: i64,
+    end_day: i64,
+    from: &str,
+) -> Result<Vec<Event>> {
+    if start_day > end_day {
+        return Ok(Vec::new());
+    }
+
+    let query_text = comment_search_query_text(scope, &config.username, start_day, end_day);
+    let json = fetch_comment_search_page(token, &query_text, None)?;
+    let issue_count = json
+        .get_path(&["data", "search", "issueCount"])
+        .and_then(Json::number)
+        .unwrap_or(0.0) as i64;
+    if issue_count >= 1000 {
+        if start_day >= end_day {
+            return Err(format!(
+                "comment search for `{query_text}` returned {issue_count} threads in one day; narrow the scope to avoid GitHub search caps"
+            ));
+        }
+        let mid_day = start_day + ((end_day - start_day) / 2);
+        let mut events =
+            fetch_comment_events_for_range(token, config, scope, start_day, mid_day, from)?;
+        events.extend(fetch_comment_events_for_range(
+            token,
+            config,
+            scope,
+            mid_day + 1,
+            end_day,
+            from,
+        )?);
+        return Ok(events);
+    }
+
+    let mut events = Vec::new();
+    collect_comment_search_page(token, config, from, &query_text, &json, &mut events)?;
+    let mut has_next = json_has_next_page(&json, &["data", "search", "pageInfo"]);
+    let mut after = json
+        .get_path(&["data", "search", "pageInfo", "endCursor"])
+        .and_then(Json::string)
+        .map(str::to_string);
+    while has_next {
+        let Some(cursor) = after.as_deref() else {
+            break;
+        };
+        let json = fetch_comment_search_page(token, &query_text, Some(cursor))?;
+        collect_comment_search_page(token, config, from, &query_text, &json, &mut events)?;
+        has_next = json_has_next_page(&json, &["data", "search", "pageInfo"]);
+        after = json
+            .get_path(&["data", "search", "pageInfo", "endCursor"])
+            .and_then(Json::string)
+            .map(str::to_string);
+    }
+
+    Ok(events)
+}
+
+fn comment_search_query_text(scope: &str, username: &str, start_day: i64, end_day: i64) -> String {
+    format!(
+        "{scope} commenter:{username} updated:{}..{}",
+        date_from_days(start_day),
+        date_from_days(end_day)
+    )
+}
+
+fn collect_comment_search_page(
+    token: &str,
+    config: &Config,
+    from: &str,
+    query_text: &str,
+    json: &Json,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    for thread in json
+        .get_path(&["data", "search", "nodes"])
+        .and_then(Json::array)
+        .unwrap_or(&[])
+    {
+        let thread_node_id = thread.get("id").and_then(Json::string).unwrap_or("");
+        let repo = thread
+            .get_path(&["repository", "nameWithOwner"])
+            .and_then(Json::string)
+            .unwrap_or("");
+        if !repo_allowed(config, repo) {
+            continue;
+        }
+        let number = thread.get("number").and_then(Json::number).unwrap_or(0.0) as i64;
+        let thread_title = thread
+            .get("title")
+            .and_then(Json::string)
+            .unwrap_or("")
+            .to_string();
+        let thread_url = thread
+            .get("url")
+            .and_then(Json::string)
+            .unwrap_or("")
+            .to_string();
+        if !thread_node_id.is_empty() {
+            events.extend(fetch_thread_comment_events(
+                token,
+                config,
+                ThreadContext {
+                    node_id: thread_node_id,
+                    repo,
+                    number,
+                    title: &thread_title,
+                    url: &thread_url,
+                },
+                from,
+            )?);
+        }
+    }
+    let issue_count = json
+        .get_path(&["data", "search", "issueCount"])
+        .and_then(Json::number)
+        .unwrap_or(0.0) as i64;
+    if issue_count >= 1000 {
+        return Err(format!(
+            "comment search for `{query_text}` reached GitHub search cap unexpectedly"
+        ));
+    }
+    Ok(())
+}
+
+fn comment_search_scopes(config: &Config) -> BTreeSet<String> {
+    let mut scopes = BTreeSet::new();
+    for org in &config.allowlist_orgs {
+        scopes.insert(format!("org:{org}"));
+    }
     for repo in &config.allowlist {
-        let query_text = format!(
-            "repo:{repo} commenter:{} updated:>={since}",
-            config.username
-        );
-        let query = r#"
-query($query:String!) {
-  search(query:$query, type:ISSUE, first:100) {
+        if !repo_owner_allowed(config, repo) {
+            scopes.insert(format!("repo:{repo}"));
+        }
+    }
+    scopes
+}
+
+fn fetch_comment_search_page(token: &str, query_text: &str, after: Option<&str>) -> Result<Json> {
+    let query = r#"
+query($query:String!, $after:String) {
+  search(query:$query, type:ISSUE, first:100, after:$after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
     nodes {
       ... on Issue {
-        number title url
+        id number title url
         repository { nameWithOwner }
-        comments(first:100) { nodes { id url createdAt author { login } } }
       }
       ... on PullRequest {
-        number title url
+        id number title url
         repository { nameWithOwner }
-        comments(first:100) { nodes { id url createdAt author { login } } }
       }
     }
   }
 }
 "#;
-        let body = format!(
-            r#"{{"query":"{}","variables":{{"query":"{}"}}}}"#,
-            json_escape(query),
-            json_escape(&query_text)
-        );
-        let output = Command::new("curl")
-            .args([
-                "-sS",
-                "-X",
-                "POST",
-                "-H",
-                &format!("Authorization: bearer {token}"),
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                "https://api.github.com/graphql",
-            ])
-            .output()
-            .map_err(|e| format!("failed to run curl: {e}"))?;
-        if !output.status.success() {
-            return Err(format!("curl failed with status {}", output.status));
-        }
-        let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-        let json = parse_json(&text)?;
-        if json.get_path(&["errors"]).is_some() {
-            return Err(format!("GitHub comment search returned errors: {text}"));
-        }
-        for thread in json
-            .get_path(&["data", "search", "nodes"])
+    let after = after
+        .map(|cursor| format!(r#""{}""#, json_escape(cursor)))
+        .unwrap_or_else(|| "null".into());
+    let body = format!(
+        r#"{{"query":"{}","variables":{{"query":"{}","after":{}}}}}"#,
+        json_escape(query),
+        json_escape(query_text),
+        after
+    );
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            "-H",
+            &format!("Authorization: bearer {token}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            "https://api.github.com/graphql",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("curl failed with status {}", output.status));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    let json = parse_json(&text)?;
+    if json.get_path(&["errors"]).is_some() {
+        return Err(format!("GitHub comment search returned errors: {text}"));
+    }
+    Ok(json)
+}
+
+struct ThreadContext<'a> {
+    node_id: &'a str,
+    repo: &'a str,
+    number: i64,
+    title: &'a str,
+    url: &'a str,
+}
+
+fn fetch_thread_comment_events(
+    token: &str,
+    config: &Config,
+    thread: ThreadContext<'_>,
+    from: &str,
+) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let json = fetch_thread_comments_page(token, thread.node_id, after.as_deref())?;
+        let comments = json
+            .get_path(&["data", "node", "comments", "nodes"])
             .and_then(Json::array)
-            .unwrap_or(&[])
-        {
-            let repo = thread
-                .get_path(&["repository", "nameWithOwner"])
+            .unwrap_or(&[]);
+        for comment in comments {
+            if comment
+                .get_path(&["author", "login"])
                 .and_then(Json::string)
-                .unwrap_or("");
-            let number = thread.get("number").and_then(Json::number).unwrap_or(0.0) as i64;
-            let thread_title = thread
-                .get("title")
-                .and_then(Json::string)
-                .unwrap_or("")
-                .to_string();
-            let thread_url = thread
-                .get("url")
-                .and_then(Json::string)
-                .unwrap_or("")
-                .to_string();
-            for comment in thread
-                .get_path(&["comments", "nodes"])
-                .and_then(Json::array)
-                .unwrap_or(&[])
+                != Some(config.username.as_str())
             {
-                if comment
-                    .get_path(&["author", "login"])
-                    .and_then(Json::string)
-                    != Some(config.username.as_str())
-                {
-                    continue;
-                }
-                let occurred_at = comment
-                    .get("createdAt")
+                continue;
+            }
+            let occurred_at = comment
+                .get("createdAt")
+                .and_then(Json::string)
+                .unwrap_or("")
+                .to_string();
+            if occurred_at.is_empty() || occurred_at.as_str() < from {
+                continue;
+            }
+            events.push(Event {
+                id: comment
+                    .get("id")
                     .and_then(Json::string)
                     .unwrap_or("")
-                    .to_string();
-                if occurred_at.is_empty() || occurred_at.as_str() < from {
-                    continue;
-                }
-                events.push(Event {
-                    id: comment
-                        .get("id")
-                        .and_then(Json::string)
-                        .unwrap_or("")
-                        .to_string(),
-                    event_type: "comment".into(),
-                    repo: repo.into(),
-                    title: format!("Commented on {thread_title}"),
-                    url: comment
-                        .get("url")
-                        .and_then(Json::string)
-                        .unwrap_or("")
-                        .to_string(),
-                    occurred_at,
-                    thread_id: format!("{repo}#{number}"),
-                    thread_title: thread_title.clone(),
-                    thread_url: thread_url.clone(),
-                    status: String::new(),
-                });
-            }
+                    .to_string(),
+                event_type: "comment".into(),
+                repo: thread.repo.into(),
+                title: format!("Commented on {}", thread.title),
+                url: comment
+                    .get("url")
+                    .and_then(Json::string)
+                    .unwrap_or("")
+                    .to_string(),
+                occurred_at,
+                thread_id: format!("{}#{}", thread.repo, thread.number),
+                thread_title: thread.title.into(),
+                thread_url: thread.url.into(),
+                status: String::new(),
+            });
+        }
+
+        let Some(page_info) = json.get_path(&["data", "node", "comments", "pageInfo"]) else {
+            break;
+        };
+        let has_next = page_info
+            .get("hasNextPage")
+            .and_then(Json::bool)
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        after = page_info
+            .get("endCursor")
+            .and_then(Json::string)
+            .map(str::to_string);
+        if after.is_none() {
+            break;
         }
     }
     Ok(events)
+}
+
+fn fetch_thread_comments_page(token: &str, node_id: &str, after: Option<&str>) -> Result<Json> {
+    let query = r#"
+query($id:ID!, $after:String) {
+  node(id:$id) {
+    ... on Issue {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id url createdAt author { login } }
+      }
+    }
+    ... on PullRequest {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id url createdAt author { login } }
+      }
+    }
+  }
+}
+"#;
+    let after = after
+        .map(|cursor| format!(r#""{}""#, json_escape(cursor)))
+        .unwrap_or_else(|| "null".into());
+    let body = format!(
+        r#"{{"query":"{}","variables":{{"id":"{}","after":{}}}}}"#,
+        json_escape(query),
+        json_escape(node_id),
+        after
+    );
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            "-H",
+            &format!("Authorization: bearer {token}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            "https://api.github.com/graphql",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("curl failed with status {}", output.status));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    let json = parse_json(&text)?;
+    if json.get_path(&["errors"]).is_some() {
+        return Err(format!("GitHub thread comments returned errors: {text}"));
+    }
+    Ok(json)
+}
+
+fn json_has_next_page(json: &Json, page_info_path: &[&str]) -> bool {
+    json.get_path(page_info_path)
+        .and_then(|page_info| page_info.get("hasNextPage"))
+        .and_then(Json::bool)
+        .unwrap_or(false)
 }
 
 fn repo_matches_keywords(repo: Option<&Json>, keywords: &[String]) -> bool {
@@ -709,7 +1016,7 @@ fn candidate_report(config: &Config, candidates: &BTreeSet<String>) -> String {
     .unwrap();
     writeln!(
         out,
-        "Curate candidates by adding approved repositories to `config/site.toml` `allowlist`.\n"
+        "Curate candidates by adding approved repositories to `config/site.toml` `allowlist` or approved organizations to `allowlist_orgs`.\n"
     )
     .unwrap();
     for repo in candidates {
@@ -1440,8 +1747,8 @@ impl Parser {
         self.ws();
         match self.peek() {
             Some('n') => self.literal("null", Json::Null),
-            Some('t') => self.literal("true", Json::Bool(())),
-            Some('f') => self.literal("false", Json::Bool(())),
+            Some('t') => self.literal("true", Json::Bool(true)),
+            Some('f') => self.literal("false", Json::Bool(false)),
             Some('"') => self.string().map(Json::String),
             Some('[') => self.array(),
             Some('{') => self.object(),
@@ -1609,6 +1916,13 @@ impl Json {
             _ => None,
         }
     }
+
+    fn bool(&self) -> Option<bool> {
+        match self {
+            Json::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 fn write_parented(path: &Path, body: &str) -> Result<()> {
@@ -1616,6 +1930,47 @@ fn write_parented(path: &Path, body: &str) -> Result<()> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn required_string<'a>(json: &'a Json, path: &[&str]) -> Result<&'a str> {
+    let value = string_field(json, path)?;
+    if value.is_empty() {
+        return Err(format!("empty string field {}", path.join(".")));
+    }
+    Ok(value)
+}
+
+fn is_rfc3339_utc(value: &str) -> bool {
+    if value.len() != 20 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return false;
+    }
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !bytes[index].is_ascii_digit() {
+            return false;
+        }
+    }
+    let month = value[5..7].parse::<u32>().unwrap_or(0);
+    let day = value[8..10].parse::<u32>().unwrap_or(0);
+    let hour = value[11..13].parse::<u32>().unwrap_or(24);
+    let minute = value[14..16].parse::<u32>().unwrap_or(60);
+    let second = value[17..19].parse::<u32>().unwrap_or(60);
+    (1..=12).contains(&month) && (1..=31).contains(&day) && hour < 24 && minute < 60 && second < 60
+}
+
+fn string_field<'a>(json: &'a Json, path: &[&str]) -> Result<&'a str> {
+    json.get_path(path)
+        .and_then(Json::string)
+        .ok_or_else(|| format!("missing string field {}", path.join(".")))
 }
 
 fn json_escape(s: &str) -> String {
@@ -1673,6 +2028,36 @@ fn unix_to_rfc3339(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+fn date_days(value: &str) -> Option<i64> {
+    let date = value.get(0..10)?;
+    let bytes = date.as_bytes();
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let year = date.get(0..4)?.parse::<i64>().ok()?;
+    let month = date.get(5..7)?.parse::<i64>().ok()?;
+    let day = date.get(8..10)?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn date_from_days(days: i64) -> String {
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1698,6 +2083,100 @@ mod tests {
     fn parses_config_arrays() {
         let items = parse_toml_array(r#"["bitcoin", "hwi"]"#).unwrap();
         assert_eq!(items, vec!["bitcoin", "hwi"]);
+    }
+
+    #[test]
+    fn repo_allowed_supports_orgs_and_excludes() {
+        let cfg = Config {
+            allowlist_orgs: BTreeSet::from(["bitcoindevkit".into()]),
+            allowlist: BTreeSet::from(["bitcoin/bitcoin".into()]),
+            exclude: BTreeSet::from(["bitcoindevkit/noise".into()]),
+            ..Config::default()
+        };
+
+        assert!(repo_allowed(&cfg, "bitcoindevkit/bdk_wallet"));
+        assert!(repo_allowed(&cfg, "bitcoin/bitcoin"));
+        assert!(!repo_allowed(&cfg, "bitcoindevkit/noise"));
+        assert!(!repo_allowed(&cfg, "other/repo"));
+    }
+
+    #[test]
+    fn comment_scopes_use_orgs_without_duplicate_repo_scopes() {
+        let cfg = Config {
+            allowlist_orgs: BTreeSet::from(["bitcoindevkit".into()]),
+            allowlist: BTreeSet::from([
+                "bitcoin/bitcoin".into(),
+                "bitcoindevkit/bdk_wallet".into(),
+            ]),
+            ..Config::default()
+        };
+        let scopes = comment_search_scopes(&cfg);
+
+        assert!(scopes.contains("org:bitcoindevkit"));
+        assert!(scopes.contains("repo:bitcoin/bitcoin"));
+        assert!(!scopes.contains("repo:bitcoindevkit/bdk_wallet"));
+    }
+
+    #[test]
+    fn comment_search_uses_bounded_date_ranges() {
+        let start = date_days("2026-05-01T00:00:00Z").unwrap();
+        let end = date_days("2026-05-27T23:59:59Z").unwrap();
+
+        assert_eq!(date_from_days(start), "2026-05-01");
+        assert_eq!(
+            comment_search_query_text("org:bitcoindevkit", "noahjoeris", start, end),
+            "org:bitcoindevkit commenter:noahjoeris updated:2026-05-01..2026-05-27"
+        );
+    }
+
+    #[test]
+    fn extracts_org_allowlisted_contribution() {
+        let cfg = Config {
+            username: "noahjoeris".into(),
+            allowlist_orgs: BTreeSet::from(["bitcoindevkit".into()]),
+            ..Config::default()
+        };
+        let graph = parse_json(
+            r#"{
+              "data": {
+                "user": {
+                  "contributionsCollection": {
+                    "pullRequestContributionsByRepository": [{
+                      "repository": {
+                        "nameWithOwner": "bitcoindevkit/bdk_wallet",
+                        "description": "wallet",
+                        "repositoryTopics": { "nodes": [] }
+                      },
+                      "contributions": {
+                        "nodes": [{
+                          "pullRequest": {
+                            "id": "pr-1",
+                            "number": 490,
+                            "title": "Improve wallet signing",
+                            "url": "https://github.com/bitcoindevkit/bdk_wallet/pull/490",
+                            "createdAt": "2026-05-12T08:00:00Z",
+                            "state": "OPEN",
+                            "closed": false,
+                            "merged": false
+                          }
+                        }]
+                      }
+                    }],
+                    "issueContributionsByRepository": [],
+                    "commitContributionsByRepository": [],
+                    "pullRequestReviewContributionsByRepository": []
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let (events, candidates) = extract_contributions(&cfg, &graph).unwrap();
+
+        assert!(candidates.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].repo, "bitcoindevkit/bdk_wallet");
     }
 
     #[test]
@@ -1778,6 +2257,18 @@ mod tests {
     }
 
     #[test]
+    fn validates_feed_fixture() {
+        validate_feed_cmd(&["--feed".into(), "fixtures/feed.json".into()]).unwrap();
+    }
+
+    #[test]
+    fn validates_utc_timestamp_shape() {
+        assert!(is_rfc3339_utc("2026-05-27T11:10:47Z"));
+        assert!(!is_rfc3339_utc("2026-99-27T11:10:47Z"));
+        assert!(!is_rfc3339_utc("2026-05-27 11:10:47Z"));
+    }
+
+    #[test]
     fn renders_static_page() {
         let cfg = Config {
             username: "noahjoeris".into(),
@@ -1785,6 +2276,7 @@ mod tests {
             base_path: "/btc_foss/".into(),
             site_root: "https://noahjoeris.github.io".into(),
             bootstrap_months: 24,
+            allowlist_orgs: BTreeSet::from(["rust-bitcoin".into(), "bitcoindevkit".into()]),
             allowlist: BTreeSet::new(),
             keywords: vec!["bitcoin".into()],
             exclude: BTreeSet::new(),
@@ -1797,5 +2289,6 @@ mod tests {
         assert!(html.contains("<span>pull requests</span>"));
         assert!(html.contains("feed.json"));
         assert!(html.contains("wizardsardine/bhwi"));
+        assert!(html.contains("bitcoindevkit/bdk_wallet"));
     }
 }
