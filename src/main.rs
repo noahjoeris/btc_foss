@@ -688,7 +688,6 @@ fn collect_comment_search_page(
         .and_then(Json::array)
         .unwrap_or(&[])
     {
-        let thread_node_id = thread.get("id").and_then(Json::string).unwrap_or("");
         let repo = thread
             .get_path(&["repository", "nameWithOwner"])
             .and_then(Json::string)
@@ -697,6 +696,9 @@ fn collect_comment_search_page(
             continue;
         }
         let number = thread.get("number").and_then(Json::number).unwrap_or(0.0) as i64;
+        if number <= 0 {
+            continue;
+        }
         let thread_title = thread
             .get("title")
             .and_then(Json::string)
@@ -707,20 +709,17 @@ fn collect_comment_search_page(
             .and_then(Json::string)
             .unwrap_or("")
             .to_string();
-        if !thread_node_id.is_empty() {
-            events.extend(fetch_thread_comment_events(
-                token,
-                config,
-                ThreadContext {
-                    node_id: thread_node_id,
-                    repo,
-                    number,
-                    title: &thread_title,
-                    url: &thread_url,
-                },
-                from,
-            )?);
-        }
+        events.extend(fetch_thread_comment_events(
+            token,
+            config,
+            ThreadContext {
+                repo,
+                number,
+                title: &thread_title,
+                url: &thread_url,
+            },
+            from,
+        )?);
     }
     let issue_count = json
         .get_path(&["data", "search", "issueCount"])
@@ -802,7 +801,6 @@ query($query:String!, $after:String) {
 }
 
 struct ThreadContext<'a> {
-    node_id: &'a str,
     repo: &'a str,
     number: i64,
     title: &'a str,
@@ -816,23 +814,18 @@ fn fetch_thread_comment_events(
     from: &str,
 ) -> Result<Vec<Event>> {
     let mut events = Vec::new();
-    let mut after: Option<String> = None;
+    let mut page = 1;
     loop {
-        let json = fetch_thread_comments_page(token, thread.node_id, after.as_deref())?;
-        let comments = json
-            .get_path(&["data", "node", "comments", "nodes"])
-            .and_then(Json::array)
-            .unwrap_or(&[]);
-        for comment in comments {
-            if comment
-                .get_path(&["author", "login"])
-                .and_then(Json::string)
+        let comments = fetch_thread_comments_page(token, thread.repo, thread.number, page)?;
+        let comment_count = comments.len();
+        for comment in &comments {
+            if comment.get_path(&["user", "login"]).and_then(Json::string)
                 != Some(config.username.as_str())
             {
                 continue;
             }
             let occurred_at = comment
-                .get("createdAt")
+                .get("created_at")
                 .and_then(Json::string)
                 .unwrap_or("")
                 .to_string();
@@ -840,16 +833,12 @@ fn fetch_thread_comment_events(
                 continue;
             }
             events.push(Event {
-                id: comment
-                    .get("id")
-                    .and_then(Json::string)
-                    .unwrap_or("")
-                    .to_string(),
+                id: json_id_string(comment.get("id")),
                 event_type: "comment".into(),
                 repo: thread.repo.into(),
                 title: format!("Commented on {}", thread.title),
                 url: comment
-                    .get("url")
+                    .get("html_url")
                     .and_then(Json::string)
                     .unwrap_or("")
                     .to_string(),
@@ -860,80 +849,39 @@ fn fetch_thread_comment_events(
                 status: String::new(),
             });
         }
-
-        let Some(page_info) = json.get_path(&["data", "node", "comments", "pageInfo"]) else {
-            break;
-        };
-        let has_next = page_info
-            .get("hasNextPage")
-            .and_then(Json::bool)
-            .unwrap_or(false);
-        if !has_next {
+        if comment_count < 100 {
             break;
         }
-        after = page_info
-            .get("endCursor")
-            .and_then(Json::string)
-            .map(str::to_string);
-        if after.is_none() {
-            break;
-        }
+        page += 1;
     }
     Ok(events)
 }
 
-fn fetch_thread_comments_page(token: &str, node_id: &str, after: Option<&str>) -> Result<Json> {
-    let query = r#"
-query($id:ID!, $after:String) {
-  node(id:$id) {
-    ... on Issue {
-      comments(first:100, after:$after) {
-        pageInfo { hasNextPage endCursor }
-        nodes { id url createdAt author { login } }
-      }
-    }
-    ... on PullRequest {
-      comments(first:100, after:$after) {
-        pageInfo { hasNextPage endCursor }
-        nodes { id url createdAt author { login } }
-      }
-    }
-  }
-}
-"#;
-    let after = after
-        .map(|cursor| format!(r#""{}""#, json_escape(cursor)))
-        .unwrap_or_else(|| "null".into());
-    let body = format!(
-        r#"{{"query":"{}","variables":{{"id":"{}","after":{}}}}}"#,
-        json_escape(query),
-        json_escape(node_id),
-        after
+fn fetch_thread_comments_page(
+    token: &str,
+    repo: &str,
+    number: i64,
+    page: i64,
+) -> Result<Vec<Json>> {
+    let url = format!(
+        "https://api.github.com/repos/{repo}/issues/{number}/comments?per_page=100&page={page}"
     );
-    let output = Command::new("curl")
-        .args([
-            "-sS",
-            "-X",
-            "POST",
-            "-H",
-            &format!("Authorization: bearer {token}"),
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body,
-            "https://api.github.com/graphql",
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("curl failed with status {}", output.status));
+    let json = curl_json(token, "GET", &url, None)?;
+    if let Some(comments) = json.array() {
+        return Ok(comments.to_vec());
     }
-    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    let json = parse_json(&text)?;
-    if json.get_path(&["errors"]).is_some() {
-        return Err(format!("GitHub thread comments returned errors: {text}"));
+    let json = curl_public_json("GET", &url, None)?;
+    json.array()
+        .map(<[Json]>::to_vec)
+        .ok_or_else(|| format!("GitHub issue comments returned non-array response for {url}"))
+}
+
+fn json_id_string(value: Option<&Json>) -> String {
+    match value {
+        Some(Json::String(value)) => value.clone(),
+        Some(Json::Number(value)) => format!("{value:.0}"),
+        _ => String::new(),
     }
-    Ok(json)
 }
 
 fn json_has_next_page(json: &Json, page_info_path: &[&str]) -> bool {
@@ -1060,6 +1008,28 @@ fn curl_json(token: &str, method: &str, url: &str, body: Option<&str>) -> Result
         method,
         "-H",
         &format!("Authorization: bearer {token}"),
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+    ]);
+    if let Some(body) = body {
+        cmd.args(["-H", "Content-Type: application/json", "-d", body]);
+    }
+    let output = cmd.arg(url).output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!("curl {method} {url} failed: {}", output.status));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    parse_json(&text)
+}
+
+fn curl_public_json(method: &str, url: &str, body: Option<&str>) -> Result<Json> {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-X",
+        method,
         "-H",
         "Accept: application/vnd.github+json",
         "-H",
