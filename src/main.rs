@@ -718,7 +718,7 @@ struct CommentThread {
 }
 
 fn fetch_comment_search_page(
-    _token: &str,
+    token: &str,
     query_text: &str,
     page: i64,
 ) -> Result<CommentSearchPage> {
@@ -726,7 +726,7 @@ fn fetch_comment_search_page(
         "https://api.github.com/search/issues?q={}&per_page=100&page={page}",
         url_encode(query_text)
     );
-    let json = curl_public_json("GET", &url, None)?;
+    let json = curl_json(token, "GET", &url, None)?;
     parse_comment_search_page(&json, page)
 }
 
