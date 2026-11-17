@@ -1949,8 +1949,15 @@ fn months_ago_rfc3339(months: i64) -> String {
     months_before_rfc3339(now_secs(), months)
 }
 
+/// Subtracts calendar months, clamping the day to the target month's length.
 fn months_before_rfc3339(secs: i64, months: i64) -> String {
-    unix_to_rfc3339(secs - months * 31 * 24 * 60 * 60)
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let total = year * 12 + month - 1 - months;
+    let (year, month) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+    let month_start = days_from_civil(year, month, 1);
+    let month_len = days_from_civil(year + month / 12, month % 12 + 1, 1) - month_start;
+    let days = month_start + day.min(month_len) - 1;
+    unix_to_rfc3339(days * 86_400 + secs.rem_euclid(86_400))
 }
 
 fn now_secs() -> i64 {
@@ -2147,8 +2154,33 @@ mod tests {
         let to = days_from_civil(2026, 5, 15) * 86_400;
         let windows = contribution_windows(24, to);
         assert_eq!(windows.len(), 4);
-        assert_eq!(windows[0].1, "2026-05-15T00:00:00Z");
+        assert_eq!(
+            windows[0],
+            ("2025-11-15T00:00:00Z".into(), "2026-05-15T00:00:00Z".into())
+        );
+        assert_eq!(windows[3].0, "2024-05-15T00:00:00Z");
         assert!(windows.iter().all(|(start, end)| start < end));
+    }
+
+    #[test]
+    fn subtracts_calendar_months() {
+        let secs = |y, m, d| days_from_civil(y, m, d) * 86_400 + 3_661;
+        assert_eq!(
+            months_before_rfc3339(secs(2026, 5, 31), 3),
+            "2026-02-28T01:01:01Z"
+        );
+        assert_eq!(
+            months_before_rfc3339(secs(2024, 3, 31), 1),
+            "2024-02-29T01:01:01Z"
+        );
+        assert_eq!(
+            months_before_rfc3339(secs(2026, 1, 15), 13),
+            "2024-12-15T01:01:01Z"
+        );
+        assert_eq!(
+            months_before_rfc3339(secs(2026, 1, 15), 0),
+            "2026-01-15T01:01:01Z"
+        );
     }
 
     #[test]
