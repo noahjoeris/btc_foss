@@ -103,9 +103,8 @@ fn collect_cmd(args: &[String]) -> Result<()> {
     }
 
     let from = months_ago_rfc3339(config.bootstrap_months);
-    let to = now_rfc3339();
     let mut candidates = BTreeSet::new();
-    for (window_from, window_to) in contribution_windows(config.bootstrap_months, &to) {
+    for (window_from, window_to) in contribution_windows(config.bootstrap_months, now_secs()) {
         let graph = fetch_contributions(&token, &config.username, &window_from, &window_to)?;
         let (events, found_candidates) = extract_contributions(&config, &graph)?;
         merge_events(&mut feed.events, events);
@@ -901,20 +900,17 @@ fn prune_events_before(events: &mut Vec<Event>, from: &str) {
     events.retain(|event| event.occurred_at.as_str() >= from);
 }
 
-fn contribution_windows(months: i64, to: &str) -> Vec<(String, String)> {
+fn contribution_windows(months: i64, to_secs: i64) -> Vec<(String, String)> {
     let months = months.max(1);
     let step = 6;
     let mut windows = Vec::new();
     let mut end_offset = 0;
     while end_offset < months {
         let start_offset = (end_offset + step).min(months);
-        let start = months_ago_rfc3339(start_offset);
-        let end = if end_offset == 0 {
-            to.to_string()
-        } else {
-            months_ago_rfc3339(end_offset)
-        };
-        windows.push((start, end));
+        windows.push((
+            months_before_rfc3339(to_secs, start_offset),
+            months_before_rfc3339(to_secs, end_offset),
+        ));
         end_offset = start_offset;
     }
     windows
@@ -1950,7 +1946,11 @@ fn now_rfc3339() -> String {
 }
 
 fn months_ago_rfc3339(months: i64) -> String {
-    unix_to_rfc3339(now_secs() - months * 31 * 24 * 60 * 60)
+    months_before_rfc3339(now_secs(), months)
+}
+
+fn months_before_rfc3339(secs: i64, months: i64) -> String {
+    unix_to_rfc3339(secs - months * 31 * 24 * 60 * 60)
 }
 
 fn now_secs() -> i64 {
@@ -2144,7 +2144,8 @@ mod tests {
 
     #[test]
     fn splits_long_collection_windows() {
-        let windows = contribution_windows(24, "2026-05-15T00:00:00Z");
+        let to = days_from_civil(2026, 5, 15) * 86_400;
+        let windows = contribution_windows(24, to);
         assert_eq!(windows.len(), 4);
         assert_eq!(windows[0].1, "2026-05-15T00:00:00Z");
         assert!(windows.iter().all(|(start, end)| start < end));
