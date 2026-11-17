@@ -3,44 +3,34 @@
 ## Project
 
 - This repo generates a static GitHub Pages site for Bitcoin FOSS contribution activity.
-- Source of truth is mostly [src/main.rs](/home/trev/Workspace/rust-projects/btc_foss/src/main.rs).
+- Rust source lives in `src/`:
+  - `main.rs`: CLI commands and wiring.
+  - `config.rs`: `config/site.toml` parsing and repo allowlist rules.
+  - `github.rs`: GitHub API collection (contributions, comment search, candidate issue).
+  - `feed.rs`: `Event`/`Feed` model, feed JSON, merge and prune.
+  - `render.rs`: HTML, CSS, JS and theme generation.
+  - `json.rs`: minimal JSON parser and helpers.
+  - `dates.rs`: timestamp and calendar helpers.
 - Generated output lives under `public/` and is ignored. Do not treat generated files as source changes.
-- Config is [config/site.toml](/home/trev/Workspace/rust-projects/btc_foss/config/site.toml).
-- Fixture data is [fixtures/feed.json](/home/trev/Workspace/rust-projects/btc_foss/fixtures/feed.json).
-- Deployment workflow is [.github/workflows/pages.yml](/home/trev/Workspace/rust-projects/btc_foss/.github/workflows/pages.yml).
+- Config is `config/site.toml`.
+- Fixture data is `fixtures/feed.json`.
+- Deployment workflow is `.github/workflows/pages.yml`.
+- The Rust toolchain is pinned in `rust-toolchain.toml`. Bump it deliberately and fix new lints in the same change.
 - The intended contribution window is the last 24 months. `--full` should rebuild that configured window from scratch, not scan all history.
 - Collection windows longer than one year must be split before calling GitHub `contributionsCollection`; GitHub rejects spans over one year.
 
 ## Environment
-
-- User runs GNU Guix System. Do not use `guix install`.
-- Prefer `guix shell <packages> -- <command>` for missing tools.
-- The repo has a read-only `.git` mount. Use the real git dir explicitly:
-
-```sh
-git --git-dir=.repo.git --work-tree=. status --short
-git --git-dir=.repo.git --work-tree=. diff
-git --git-dir=.repo.git --work-tree=. add <files>
-git --git-dir=.repo.git --work-tree=. commit -m "type: message"
-git --git-dir=.repo.git --work-tree=. push
-```
 
 - Use Conventional Commits for commit messages.
 - Do not push, create repos, or trigger deployments unless the user explicitly confirms.
 
 ## GitHub CLI
 
-- When using `gh`, invoke it through the user's Guix shell:
-
-```sh
-guix shell -L /home/trev/Workspace/dotfiles gh -- gh <args>
-```
-
-- Current remote is `git@github.com:trevarj/btc_foss.git`.
+- Remote is `git@github.com:noahjoeris/btc_foss.git` (fork of `trevarj/btc_foss`). Never push to upstream.
 - GitHub Pages deploy can be triggered with:
 
 ```sh
-guix shell -L /home/trev/Workspace/dotfiles gh -- gh workflow run pages.yml --repo trevarj/btc_foss
+gh workflow run pages.yml --repo noahjoeris/btc_foss
 ```
 
 ## Build And Verify
@@ -66,13 +56,11 @@ Then open:
 http://127.0.0.1:8081/btc_foss/
 ```
 
-If Python is unavailable, use a Guix shell rather than installing it.
-
 ## Styling And Themes
 
 - The page imports the main site stylesheet from `/static/style.css`.
 - It also generates and loads a page-local `theme-bitcoin.css`.
-- The Bitcoin theme follows the same pattern as the user's site themes in `/home/trev/Workspace/trevarj.github.io/static`, especially `theme-jade.css`:
+- The Bitcoin theme follows the same pattern as the main site's themes:
 
 ```css
 html[data-theme="bitcoin"],
@@ -83,8 +71,8 @@ html[data-theme="bitcoin"]::backdrop {
 ```
 
 - The generated HTML must keep `data-theme="bitcoin"` on `<html>`.
-- Keep global theme variables in `render_bitcoin_theme_css()`.
-- Keep page-specific layout rules in `render_css()`.
+- Keep global theme variables in `render_bitcoin_theme_css()` (`src/render.rs`).
+- Keep page-specific layout rules in `render_css()` (`src/render.rs`).
 - The Bitcoin theme should be dark, legible, orange-forward, and broader than the main site themes. It can use restrained teal, warm neutral, green, and red accents, but Bitcoin orange must remain the dominant accent.
 - The H1 logo is the Wikimedia Bitcoin SVG:
 
